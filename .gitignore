@@ -1,0 +1,19 @@
+﻿## Python (minimum)
+__pycache__/
+*.py[cod]
+*$py.class
+
+### Windows template
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ETC
+.ipynb_checkpoints
+**/BackupNo/
+*.BackupNo
