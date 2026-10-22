@@ -108,8 +108,9 @@ PWFILE="$DIR/save/__password"
 HASH=""
 if ! sudo test -s "$PWFILE"; then
  [[ -t 0 ]] || error 'No password set and no interactive terminal; run interactively to set one'
- read -rsp 'Set PocketRisu admin password (12+ characters): ' PW1; printf '\n'
- read -rsp 'Repeat password: ' PW2; printf '\n'
+ # IFS= keeps leading/trailing spaces: the web UI hashes the password exactly as typed.
+ IFS= read -rsp 'Set PocketRisu admin password (12+ characters): ' PW1; printf '\n'
+ IFS= read -rsp 'Repeat password: ' PW2; printf '\n'
  [[ "$PW1" == "$PW2" && ${#PW1} -ge 12 ]] || error 'Passwords do not match or are shorter than 12 characters'
  HASH=$(printf '%s' "$PW1" | sha256sum | cut -d' ' -f1)
  unset PW1 PW2
@@ -433,8 +434,8 @@ write_file "$DIR/password.sh" 700 <<'PASSWORD'
 set -Eeuo pipefail
 cd "$(dirname "$(realpath "$0")")"
 [[ -t 0 ]] || { echo 'Interactive terminal required' >&2; exit 1; }
-read -rsp 'New password (12+ characters): ' p1; echo
-read -rsp 'Repeat: ' p2; echo
+IFS= read -rsp 'New password (12+ characters): ' p1; echo
+IFS= read -rsp 'Repeat: ' p2; echo
 [[ "$p1" == "$p2" && ${#p1} -ge 12 ]] || { echo 'Password mismatch/too short' >&2; exit 1; }
 printf '%s' "$p1" | sha256sum | cut -d' ' -f1 | tr -d '\n' | sudo install -m 600 /dev/stdin save/__password
 # Same owner as save/, which the installer assigns to the container user.
