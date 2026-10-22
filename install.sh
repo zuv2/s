@@ -88,7 +88,8 @@ parse_allow() {
 # apt python3 is present on normal Ubuntu 24.04; validate before touching system.
 command -v python3 >/dev/null || error 'python3 is required (standard on Ubuntu 24.04)'
 if (( ALLOW_SET )); then ALLOW_CONTENT=$(parse_allow "$ALLOW"); fi
-sudo -v || error 'sudo authentication failed'
+# Not 'sudo -v': it demands a password unless every sudoers entry is NOPASSWD, which cloud images (no user password) fail.
+sudo true || error 'sudo is not usable'
 # Finish every check and prompt before the first system change.
 # Prevent accidental concurrent use of a single global POCKETRISU chain with a different install.
 if sudo test -s /etc/pocketrisu/port && [[ "$(sudo cat /etc/pocketrisu/port)" != "$PORT" ]]; then
