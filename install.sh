@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 
-DIR="$HOME/pocketrisu"; PORT=6001; TAG=latest; IP=""; EMAIL=""; HTTPS=1; START=1; ALLOW=""; ALLOW_SET=0
+DIR="$HOME/pocketrisu"; PORT=60011; TAG=latest; IP=""; EMAIL=""; HTTPS=1; START=1; ALLOW=""; ALLOW_SET=0
 IMAGE=ghcr.io/pocketrisu/pocketrisu
 BR=pocketrisu0
 FW=/usr/local/sbin/pocketrisu-firewall
@@ -15,7 +15,7 @@ msg() { printf '[PocketRisu] %s\n' "$*"; }
 usage() { cat <<'USAGE'
 Usage: ./install.sh [options]
   --dir PATH          Installation directory (default: ~/pocketrisu)
-  --port N            Public service port (default: 6001)
+  --port N            Public service port (default: 60011)
   --tag TAG           Container image tag (default: latest; numeric tags get a v prefix: 1.2 -> v1.2)
   --ip IPv4           Public IPv4 for Let's Encrypt IP certificate
   --email ADDRESS     Let's Encrypt contact email (optional)
