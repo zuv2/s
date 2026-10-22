@@ -179,6 +179,8 @@ if [[ "$MODE" == tailscale ]]; then
   sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install "${APT[@]}" tailscale
  fi
  sudo systemctl enable --now tailscaled
+ # A freshly started daemon briefly reports no state, which would be mistaken for a fresh install.
+ for _ in {1..30}; do case "$(ts_field state)" in ''|NoState|Starting) sleep 1 ;; *) break ;; esac; done
  if (( TS_LOGIN )) && [[ "$(ts_field state)" != Running ]]; then
   case "$(ts_field state)" in
    ''|NoState|NeedsLogin) ;;
@@ -193,6 +195,7 @@ if [[ "$MODE" == tailscale ]]; then
   fi
  fi
  unset TSKEY
+ for _ in {1..30}; do [[ "$(ts_field state)" == Running ]] && break; sleep 1; done
  [[ "$(ts_field state)" == Running ]] || error 'Tailscale is not connected (device approval pending?); fix in the admin console and re-run'
  # tailscale serve needs MagicDNS and HTTPS certificates enabled for the tailnet; check instead of letting it prompt.
  TS_DNS=$(ts_field dns)
@@ -270,6 +273,9 @@ printf '%s\n' "$MODE" | sudo install -m 600 /dev/stdin /etc/pocketrisu/mode
 sudo install -m 644 /dev/stdin /etc/systemd/system/pocketrisu-firewall.service <<'UNIT'
 [Unit]
 Description=PocketRisu Docker firewall
+# netfilter-persistent (preinstalled on Oracle Cloud images) and ufw reload the filter table at boot,
+# which would delete these chains if they ran after this unit.
+After=netfilter-persistent.service ufw.service
 Before=docker.service
 [Service]
 Type=oneshot
