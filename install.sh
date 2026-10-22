@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
 # PocketRisu Ubuntu 24.04 Docker installer (amd64/arm64)
 # Download first, inspect, then execute. Do not pipe directly into bash.
+#
+# Two access modes:
+#   public (default)  The container port is published on all interfaces, guarded by a host
+#                     firewall chain with an optional source allowlist. HTTPS uses a Let's Encrypt
+#                     certificate issued for the server's public IPv4 (needs TCP 80 for renewals).
+#   --tailscale       The container is bound to 127.0.0.1 and reachable only inside your tailnet
+#                     through `tailscale serve`, which also provides HTTPS. Nothing is exposed
+#                     to the internet by this installer.
+#
+# Security model, in short:
+#   - Every check and every secret prompt runs before the first system change.
+#   - Secrets (admin password, Tailscale auth key) are read from the terminal without echo,
+#     never passed as command-line arguments, and never written to the install log.
+#   - The firewall is set up before the container is started, and is built to fail closed.
+#   - The installer never uninstalls, downgrades or silently replaces existing software
+#     or configuration it did not create; it stops and asks for manual migration instead.
+#
+# Re-running is the supported way to recover from an interrupted run or to update settings:
+# each step detects what is already in place and skips or reapplies it.
+#
+# Files created outside the install directory:
+#   /etc/pocketrisu/{port,https,mode,allow-from}      settings read by the firewall script
+#   /usr/local/sbin/pocketrisu-firewall               firewall script (run at boot and by run.sh)
+#   /etc/systemd/system/pocketrisu-firewall.service   applies the firewall before Docker starts
+#   /etc/letsencrypt/renewal-hooks/deploy/pocketrisu-deploy   public HTTPS mode only
 set -Eeuo pipefail
+# Files created by this script are private to their owner unless a mode is given explicitly.
 umask 077
 
+# ── Defaults and fixed names ────────────────────────────────────────────────────────────────
 DIR="$HOME/pocketrisu"; PORT=60011; TAG=latest; IP=""; EMAIL=""; HTTPS=1; START=1; ALLOW=""; ALLOW_SET=0; MODE=public
 IMAGE=ghcr.io/pocketrisu/pocketrisu
+# Fixed bridge name so firewall rules can match container traffic by interface.
 BR=pocketrisu0
 FW=/usr/local/sbin/pocketrisu-firewall
 ALLOW_FILE=/etc/pocketrisu/allow-from
@@ -29,6 +57,8 @@ Re-running without --allow-from preserves an existing allowlist.
 Switching an existing install between public and --tailscale mode requires manual migration.
 USAGE
 }
+
+# ── Argument parsing ────────────────────────────────────────────────────────────────────────
 while (($#)); do
  case "$1" in
   --dir|--port|--tag|--ip|--email|--allow-from)
@@ -41,27 +71,35 @@ while (($#)); do
   -h|--help) usage; exit 0;; *) error "Unknown option: $1";;
  esac
 done
+# Public-mode options would be silently ignored in Tailscale mode, so reject them instead.
 if [[ "$MODE" == tailscale ]]; then
  (( HTTPS && ! ALLOW_SET )) && [[ -z "$IP" && -z "$EMAIL" ]] || error '--tailscale cannot be combined with --ip, --email, --allow-from or --no-https'
  # TLS is terminated by tailscale serve; the container itself speaks plain HTTP on loopback.
  HTTPS=0
 fi
+
+# ── Environment and input validation (no system changes yet) ────────────────────────────────
+# The install directory, log and generated helpers belong to a regular account; the helpers call sudo themselves.
 (( EUID != 0 )) || error 'Run as a regular sudo-enabled user, not root.'
 command -v sudo >/dev/null || error 'sudo is required'
 source /etc/os-release
 [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || error 'Only Ubuntu 24.04 is supported'
 case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) error 'Only amd64 and arm64 are supported';; esac
+# 10# forces base 10 so a leading zero is not read as octal.
 [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && ((10#$PORT >= 1 && 10#$PORT <= 65535)) || error 'Invalid port'
 PORT=$((10#$PORT))
 (( HTTPS == 0 || PORT != 80 )) || error 'Port 80 is reserved for certificate issuance'
 [[ "$TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || error 'Invalid image tag'
 [[ "$TAG" =~ ^[0-9]+(\.[0-9]+)*$ ]] && TAG="v$TAG"
 [[ -z "$EMAIL" || "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || error 'Invalid email'
+# The install directory is later chown'ed and embedded in root-run scripts, so system paths are refused.
 DIR=$(realpath -m -- "$DIR")
 case "$DIR" in /|/root|/home|/tmp|/tmp/*|/etc|/etc/*|/usr|/usr/*|/var|/var/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/boot|/boot/*) error 'Unsafe install directory';; esac
 [[ "$DIR" != *$'\n'* && "$DIR" != *$'\r'* ]] || error 'No newlines allowed in install path'
 # To safely embed the path into root-owned shell code, disallow complex pathname characters.
 [[ "$DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] || error 'Install path may contain only letters, numbers, _ . / -'
+# Python's ipaddress module is used instead of regexes: it rejects malformed and out-of-range values.
+# Kinds: 'cidr' (IPv4 address or network), 'public' (globally routable IPv4 address only).
 valid_ip() { python3 - "$1" "$2" <<'PY'
 import ipaddress,sys
 try:
@@ -72,6 +110,7 @@ except (ValueError,AssertionError): sys.exit(1)
 PY
 }
 [[ -z "$IP" ]] || valid_ip "$IP" public || error 'Invalid or non-public --ip address'
+# Turns "a, b/24" into one normalized CIDR per line; a bare address becomes /32.
 parse_allow() {
  local input=$1 c
  local -a entries=()
@@ -90,6 +129,8 @@ command -v python3 >/dev/null || error 'python3 is required (standard on Ubuntu 
 if (( ALLOW_SET )); then ALLOW_CONTENT=$(parse_allow "$ALLOW"); fi
 # Not 'sudo -v': it demands a password unless every sudoers entry is NOPASSWD, which cloud images (no user password) fail.
 sudo true || error 'sudo is not usable'
+
+# ── Checks against an existing install ──────────────────────────────────────────────────────
 # Finish every check and prompt before the first system change.
 # Prevent accidental concurrent use of a single global POCKETRISU chain with a different install.
 if sudo test -s /etc/pocketrisu/port && [[ "$(sudo cat /etc/pocketrisu/port)" != "$PORT" ]]; then
@@ -104,7 +145,14 @@ else OLD_MODE=$MODE; fi
 if [[ -f "$DIR/docker-compose.yml" ]] && ! grep -q '^name: pocketrisu$' "$DIR/docker-compose.yml"; then
  error 'Existing Compose file was not generated by this installer; back up/migrate manually'
 fi
+
+# ── Secret prompts (before logging starts, so nothing typed here can reach the log) ─────────
 # Prevent takeover of an uninitialized public deployment. Existing password is never reset.
+# PocketRisu lets the first visitor set the password when save/__password is empty
+# (/api/set_password is unauthenticated), so the password is set here instead.
+# Stored format, matching the web UI: SHA-256 hex of the password, no trailing newline.
+# The server compares this value directly, so the file (and any backup of save/) is a
+# login credential in itself and must stay private.
 PWFILE="$DIR/save/__password"
 HASH=""
 if ! sudo test -s "$PWFILE"; then
@@ -113,10 +161,14 @@ if ! sudo test -s "$PWFILE"; then
  IFS= read -rsp 'Set PocketRisu admin password (12+ characters): ' PW1; printf '\n'
  IFS= read -rsp 'Repeat password: ' PW2; printf '\n'
  [[ "$PW1" == "$PW2" && ${#PW1} -ge 12 ]] || error 'Passwords do not match or are shorter than 12 characters'
+ # printf is a shell builtin, so the password never appears in a process argument list.
  HASH=$(printf '%s' "$PW1" | sha256sum | cut -d' ' -f1)
  unset PW1 PW2
 fi
 # Reads one field from tailscale status; empty when tailscale is missing or not running.
+#   state  BackendState: NoState, NeedsLogin, NeedsMachineAuth, Stopped, Starting or Running
+#   dns    this node's MagicDNS name (the HTTPS URL host), without the trailing dot
+#   cert   domains the tailnet can issue certificates for; empty when HTTPS is disabled
 ts_field() { sudo tailscale status --json 2>/dev/null | python3 -c '
 import json,sys
 d=json.load(sys.stdin); f=sys.argv[1]
@@ -125,6 +177,7 @@ elif f=="dns": print((d.get("Self") or {}).get("DNSName","").rstrip("."))
 elif f=="cert": print(",".join(d.get("CertDomains") or []))
 ' "$1" 2>/dev/null || true; }
 # The auth key is a secret: read it before logging starts, never pass it as an argument.
+# Use a non-ephemeral key: an ephemeral node is removed from the tailnet when it goes offline.
 TSKEY=""
 TS_LOGIN=0
 if [[ "$MODE" == tailscale ]] && [[ "$(ts_field state)" != Running ]]; then
@@ -133,13 +186,20 @@ if [[ "$MODE" == tailscale ]] && [[ "$(ts_field state)" != Running ]]; then
  read -rsp 'Tailscale auth key (empty = log in via browser URL): ' TSKEY; printf '\n'
  [[ -z "$TSKEY" || "$TSKEY" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || error 'Invalid Tailscale auth key format'
 fi
+
+# ── Logging ─────────────────────────────────────────────────────────────────────────────────
+# From here on, all output is copied to a private log in the home directory for troubleshooting.
 LOG="$HOME/pocketrisu-install-$(date +%Y%m%d-%H%M%S).log"
 : > "$LOG"; chmod 600 "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 trap 'printf "ERROR at line %s; log: %s\n" "$LINENO" "$LOG" >&2' ERR
 msg "Preparing $DIR with $IMAGE:$TAG (port $PORT)"
+
+# ── Base packages and Docker Engine ─────────────────────────────────────────────────────────
+# Wait up to 5 minutes for the apt lock: unattended-upgrades often holds it right after first boot.
 APT=(-y -o DPkg::Lock::Timeout=300)
 sudo apt-get update -o DPkg::Lock::Timeout=300
+# NEEDRESTART_MODE=a: restart affected services automatically instead of showing an interactive dialog.
 sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install "${APT[@]}" ca-certificates curl gnupg iptables iproute2 openssl python3 tar gzip
 # Never uninstall or migrate an existing Docker installation automatically.
 if command -v docker >/dev/null 2>&1 && sudo docker compose version >/dev/null 2>&1; then
@@ -151,6 +211,7 @@ else
   [[ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null || true)" != 'install ok installed' ]] ||
    error "Existing package '$p' conflicts with Docker Engine; resolve manually before installing"
  done
+ # Official repository with its signing key pinned via Signed-By (not the convenience script).
  msg 'Installing Docker Engine from official Docker repository'
  sudo install -m 0755 -d /etc/apt/keyrings
  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -167,10 +228,13 @@ if sudo docker info --format '{{json .FirewallBackend}}' 2>/dev/null | grep -qi 
  error 'Docker nftables backend is not supported by this installer'
 fi
 sudo iptables -S DOCKER-USER >/dev/null 2>&1 || error 'Docker DOCKER-USER iptables chain unavailable'
+
+# ── Tailscale (--tailscale only) ────────────────────────────────────────────────────────────
 if [[ "$MODE" == tailscale ]]; then
  if ! command -v tailscale >/dev/null 2>&1; then
   # Reuse a repository added by Tailscale's own instructions; a second entry with another key would break apt.
   if ! grep -rqs 'pkgs.tailscale.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+   # Same approach as Docker: official repository and pinned key, not the curl | sh installer.
    msg 'Adding official Tailscale repository'
    sudo install -m 0755 -d /etc/apt/keyrings
    sudo curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${UBUNTU_CODENAME:-noble}.noarmor.gpg" -o /etc/apt/keyrings/tailscale.gpg
@@ -183,6 +247,8 @@ if [[ "$MODE" == tailscale ]]; then
  sudo systemctl enable --now tailscaled
  # A freshly started daemon briefly reports no state, which would be mistaken for a fresh install.
  for _ in {1..30}; do case "$(ts_field state)" in ''|NoState|Starting) sleep 1 ;; *) break ;; esac; done
+ # Log in only when needed. Other states (Stopped on purpose, NeedsMachineAuth awaiting admin approval)
+ # need a decision outside this installer, so it stops instead of guessing.
  if (( TS_LOGIN )) && [[ "$(ts_field state)" != Running ]]; then
   case "$(ts_field state)" in
    ''|NoState|NeedsLogin) ;;
@@ -190,8 +256,10 @@ if [[ "$MODE" == tailscale ]]; then
   esac
   if [[ -n "$TSKEY" ]]; then
    msg 'Joining tailnet with auth key'
+   # file:/dev/stdin makes tailscale read the key from the pipe, keeping it out of ps and the log.
    printf '%s' "$TSKEY" | sudo tailscale up --auth-key=file:/dev/stdin
   else
+   # Blocks until the URL is approved. In PuTTY, select the URL to copy it; Ctrl+C aborts the installer.
    msg 'Open the login URL below in your browser to add this server to your tailnet'
    sudo tailscale up
   fi
@@ -202,13 +270,28 @@ if [[ "$MODE" == tailscale ]]; then
  # tailscale serve needs MagicDNS and HTTPS certificates enabled for the tailnet; check instead of letting it prompt.
  TS_DNS=$(ts_field dns)
  [[ -n "$TS_DNS" && -n "$(ts_field cert)" ]] || error 'Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns, then re-run'
+ # rpcbind is preinstalled on Oracle Cloud images and listens on all interfaces, but only NFSv3
+ # needs it. It is a common UDP amplification vector, so it is disabled and masked (masking also
+ # blocks socket activation) unless NFS is mounted now or configured in /etc/fstab.
+ if systemctl cat rpcbind.service >/dev/null 2>&1 && [[ "$(systemctl is-enabled rpcbind.socket 2>/dev/null || true)" != masked ]]; then
+  if findmnt -rn -t nfs,nfs4 >/dev/null || grep -qsE '^[^#[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+nfs4?[[:space:]]' /etc/fstab; then
+   msg 'NFS is in use; leaving rpcbind enabled'
+  else
+   msg 'Disabling rpcbind (only needed for NFSv3)'
+   sudo systemctl disable --now rpcbind.service rpcbind.socket
+   sudo systemctl mask rpcbind.service rpcbind.socket
+  fi
+ fi
 fi
+
+# ── Install directory and firewall settings ─────────────────────────────────────────────────
 # No docker-group membership: membership is equivalent to root authority.
 # save may already belong to a non-root container user; ownership is settled after the image is inspected.
 mkdir -p -- "$DIR"
 sudo test -d "$DIR/save" || mkdir -m 700 -- "$DIR/save"
 sudo install -d -o root -g root -m 700 -- "$DIR/certs"
 sudo install -d -m 700 /etc/pocketrisu
+# The allowlist is only used in public mode, but the file is kept in both so the firewall script is uniform.
 if (( ALLOW_SET )); then
  printf '%s\n' "$ALLOW_CONTENT" | sudo install -m 600 /dev/stdin "$ALLOW_FILE"
 elif ! sudo test -e "$ALLOW_FILE"; then
@@ -220,10 +303,18 @@ while IFS= read -r c || [[ -n "$c" ]]; do
  [[ "$c" != *[[:space:]]* ]] || error 'Allowlist must contain only one CIDR per line'
  valid_ip "$c" cidr || error "Invalid entry in $ALLOW_FILE: $c"
 done < <(sudo cat "$ALLOW_FILE")
+
+# ── Firewall script ─────────────────────────────────────────────────────────────────────────
 # Publish only after firewall is operational. Firewall chain is kept on restart.
 # A terminal DROP rule is appended before any allow rules so a mid-update failure fails closed.
+# Traffic Docker forwards to a published port passes FORWARD -> DOCKER-USER, which Docker never
+# modifies; the rules live in a POCKETRISU chain jumped to from there. Matching on the original
+# destination port (--ctorigdstport, before Docker's DNAT) and the bridge interface keeps the rules
+# limited to this container.
 sudo tee "$FW" >/dev/null <<'FIREWALL'
 #!/usr/bin/env bash
+# Generated by the PocketRisu installer; edits are overwritten on the next install run.
+# Settings come from /etc/pocketrisu (root-only), so this file contains no install-specific values.
 set -Eeuo pipefail
 PORT=$(cat /etc/pocketrisu/port)
 HTTPS=$(cat /etc/pocketrisu/https)
@@ -248,10 +339,12 @@ iptables -w -N "$C" 2>/dev/null || true
 iptables -w -I DOCKER-USER 1 -o "$BR" -p tcp -m conntrack --ctstate NEW --ctorigdstport "$PORT" -j DROP
 iptables -w -F "$C"
 # Ensure metadata service is inaccessible to containers on this bridge.
+# (The cloud metadata endpoint can hand out instance credentials and the boot user-data.)
 iptables -w -A "$C" -i "$BR" -d 169.254.169.254/32 -j DROP
 # Tailscale mode is reached only through tailscale serve on loopback, which never traverses FORWARD,
 # so every forwarded connection to the port is dropped.
 if [[ "$MODE" == public ]]; then
+ # RETURN hands an allowed connection back to Docker's own rules, which accept it.
  while IFS= read -r c || [[ -n "$c" ]]; do
   [[ -z "$c" || "$c" =~ ^[[:space:]]*# ]] && continue
   iptables -w -A "$C" -o "$BR" -p tcp -s "$c" -m conntrack --ctstate NEW --ctorigdstport "$PORT" -j RETURN
@@ -261,6 +354,7 @@ if [[ "$MODE" == public ]]; then
   iptables -w -A "$C" -o "$BR" -p tcp -m conntrack --ctstate NEW --ctorigdstport "$PORT" -j RETURN
  fi
 fi
+# Anything not returned above is dropped.
 iptables -w -A "$C" -o "$BR" -p tcp -m conntrack --ctstate NEW --ctorigdstport "$PORT" -j DROP
 iptables -w -C DOCKER-USER -j "$C" 2>/dev/null || iptables -w -I DOCKER-USER 1 -j "$C"
 # Remove the guard added at the start, plus any left by an interrupted run, leaving the validated target chain linked.
@@ -285,9 +379,11 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/pocketrisu-firewall
 ExecReload=/usr/local/sbin/pocketrisu-firewall
 [Install]
+# Also wanted by docker.service, so starting Docker by hand pulls the firewall in first.
 WantedBy=multi-user.target docker.service
 UNIT
 sudo systemctl daemon-reload
+# reenable rewrites the install symlinks, picking up a changed [Install] section on re-runs.
 sudo systemctl reenable pocketrisu-firewall.service
 sudo systemctl restart pocketrisu-firewall.service || error 'Firewall setup failed: refusing to publish port'
 sudo iptables -C DOCKER-USER -j POCKETRISU || error 'Firewall not linked'
@@ -300,6 +396,8 @@ write_file() {
  if [[ -e "$dest" ]]; then cp -p "$dest" "$dest.bak.$(date +%Y%m%d-%H%M%S%N)"; fi
  install -m "$mode" "$tmp" "$dest"; rm -f "$tmp"
 }
+
+# ── Image, ownership and password file ──────────────────────────────────────────────────────
 # Inspect the image before installing TLS files. Docker bind mounts retain host POSIX
 # permissions, so a non-root container must be granted access to the private key.
 # Do not expose the key world-readable as a workaround.
@@ -326,9 +424,12 @@ if [[ "$(sudo stat -c %u:%g -- "$DIR/save")" != "$SAVE_UID:$SAVE_GID" ]]; then
  sudo chown -R -- "$SAVE_UID:$SAVE_GID" "$DIR/save"
 fi
 sudo chmod 700 -- "$DIR/save"
+# Written only on first install; an existing password is never touched.
 if [[ -n "$HASH" ]]; then
  printf '%s' "$HASH" | sudo install -m 600 -o "$SAVE_UID" -g "$SAVE_GID" /dev/stdin "$PWFILE"
 fi
+
+# ── HTTPS certificate (public mode only) ────────────────────────────────────────────────────
 # Certificate acquisition precedes generating the HTTP/HTTPS compose file. Never fall back to HTTP implicitly.
 if (( HTTPS )); then
  if [[ -z "$IP" ]]; then
@@ -339,6 +440,7 @@ if (( HTTPS )); then
  if ! command -v snap >/dev/null; then
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install "${APT[@]}" snapd
  fi
+ # The snap is Certbot's recommended channel; Ubuntu's apt package is too old for IP address certificates.
  if ! sudo snap list certbot >/dev/null 2>&1; then sudo snap install certbot --classic; fi
  CERTBOT=/snap/bin/certbot
  [[ -x "$CERTBOT" ]] || error 'Certbot snap not available'
@@ -359,12 +461,15 @@ fi
 HOOKSCRIPT
  sudo chmod 755 "$HOOK"
  LIVE="/etc/letsencrypt/live/$IP"
+ # Reuse a certificate valid for at least another day; otherwise issue one with the standalone server on TCP 80.
  if sudo test -s "$LIVE/fullchain.pem" && sudo test -s "$LIVE/privkey.pem" && sudo openssl x509 -in "$LIVE/fullchain.pem" -noout -checkend 86400 >/dev/null 2>&1; then
   msg 'Existing IP certificate found'
  else
   [[ -z "$(sudo ss -ltnH 'sport = :80')" ]] || error 'TCP 80 is in use; standalone certificate challenge cannot run'
   MAIL=(--register-unsafely-without-email)
   [[ -z "$EMAIL" ]] || MAIL=(--email "$EMAIL" --no-eff-email)
+  # Let's Encrypt issues IP address certificates only with the short-lived profile (about six days),
+  # hence the renewal timer check below.
   sudo "$CERTBOT" certonly --standalone --preferred-profile shortlived --ip-address "$IP" --cert-name "$IP" --non-interactive --agree-tos "${MAIL[@]}" || error 'HTTPS certificate issuance failed; refusing HTTP fallback'
  fi
  # --no-start must not restart a running container; the new certificate is picked up on its next start.
@@ -380,9 +485,15 @@ else
  else msg 'Explicit HTTP mode requested; certificate will not be mounted'; fi
  if sudo test -f "$HOOK" && sudo grep -qF "$DIR/certs" "$HOOK"; then sudo rm -f "$HOOK"; fi
 fi
+
+# ── Generated files in the install directory ────────────────────────────────────────────────
+# The app serves HTTPS itself when a certificate is mounted at this path.
 if (( HTTPS )); then CERT_MOUNT='      - ./certs:/app/server/node/ssl/certificate:ro'; else CERT_MOUNT=''; fi
+# Tailscale mode binds to loopback only. The firewall's DROP rule still applies, covering older Docker
+# releases that let hosts on the same network segment reach loopback-published ports.
 if [[ "$MODE" == tailscale ]]; then BIND=127.0.0.1; else BIND=0.0.0.0; fi
 # Always generate a reviewable Compose file. No automatic destructive compose down.
+# The app listens on 6001 inside the container regardless of the host port.
 write_file "$DIR/docker-compose.yml" 644 <<COMPOSE
 name: pocketrisu
 services:
@@ -408,6 +519,7 @@ networks:
       com.docker.network.bridge.name: $BR
 COMPOSE
 # The generated helper always runs docker via sudo and never changes docker group.
+# run.sh reapplies the firewall first, so the port is never published without it.
 write_file "$DIR/run.sh" 755 <<'RUN'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -430,6 +542,7 @@ cd "$(dirname "$(realpath "$0")")"
 sudo docker compose pull
 ./run.sh
 UPDATE
+# Same storage format as the installer's prompt (SHA-256 hex, no newline); mode 700 as it handles a secret.
 write_file "$DIR/password.sh" 700 <<'PASSWORD'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -444,6 +557,7 @@ sudo chown --reference=save save/__password
 unset p1 p2
 if [[ "$(sudo docker inspect -f '{{.State.Running}}' pocketrisu 2>/dev/null || true)" == true ]]; then sudo docker restart pocketrisu; fi
 PASSWORD
+# Backups contain save/__password, which is a login credential: keep them private (mode 600).
 write_file "$DIR/backup.sh" 755 <<'BACKUP'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -459,8 +573,11 @@ echo "Backup: $out"
 BACKUP
 ( cd "$DIR" && sudo docker compose config --quiet ) || error 'Generated Compose configuration invalid'
 msg "Compose ready: $DIR/docker-compose.yml"
+
+# ── tailscale serve (--tailscale only) ──────────────────────────────────────────────────────
 if [[ "$MODE" == tailscale ]]; then
  # Never overwrite serve config for something else on this node.
+ # Accepted: no config at all, or a config that already proxies to exactly this target.
  TS_TARGET="http://127.0.0.1:$PORT"
  sudo tailscale serve status --json | python3 -c '
 import json,sys
@@ -472,8 +589,11 @@ def vals(o):
 sys.exit(0 if not d or sys.argv[1] in vals(d) else 1)
 ' "$TS_TARGET" || error 'Existing tailscale serve configuration found; remove it (sudo tailscale serve reset) or migrate manually'
  # Persistent (--bg) so it survives reboots; reapplying the same config is harmless.
+ # serve is tailnet-only; never use 'tailscale funnel' here, which would publish the app to the internet.
  sudo tailscale serve --bg --https=443 "$TS_TARGET" >/dev/null
 fi
+
+# ── Start and summary ───────────────────────────────────────────────────────────────────────
 if (( START )); then
  (cd "$DIR" && ./run.sh)
 else
