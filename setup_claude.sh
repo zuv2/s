@@ -7,8 +7,8 @@
 #
 # Download first, inspect, then execute. Do not pipe directly into bash:
 #   curl -fsSLO <raw URL of this file>
-#   less install.sh
-#   bash install.sh
+#   less setup_claude.sh
+#   bash setup_claude.sh
 #
 # Security model, in short:
 #   - Runs as a regular user. sudo is used only to install missing base packages and to
@@ -42,7 +42,7 @@ BACKUP_DIR="$CONF_DIR/backup"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="$NAME.service"
 TIMER="$NAME.timer"
-CLI_INSTALLER=https://claude.ai/install.sh
+CLI_INSTALLER=https://claude.ai/setup_claude.sh
 PROMPT='Reply with just: ok'
 DEFAULT_TIMES=00:00,01:00,05:00,06:00,09:00,10:00,14:00,15:00,19:00,20:00
 DEFAULT_TZ=Asia/Seoul
@@ -55,7 +55,7 @@ warn()  { printf '[claude-ping] WARNING: %s\n' "$*" >&2; }
 error() { printf '[claude-ping] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() { cat <<'USAGE'
-Usage: bash install.sh [options]
+Usage: bash setup_claude.sh [options]
   --times LIST     Comma-separated HH:MM run times
                    (default: 00:00,01:00,05:00,06:00,09:00,10:00,14:00,15:00,19:00,20:00)
   --tz ZONE        Timezone the times are in (default: Asia/Seoul; see timedatectl list-timezones)
@@ -77,7 +77,7 @@ guide_auth() { cat >&2 <<'G'
       Open the printed URL in a browser, approve, and paste the code back into the terminal.
    2. Copy the whole token: one string starting with sk-ant-oat01-. If the terminal wrapped
       it over several lines, copy all of them; this installer joins the pieces.
-   3. Re-run:  bash install.sh --reset-token
+   3. Re-run:  bash setup_claude.sh --reset-token
 G
 }
 guide_format() { cat >&2 <<'G'
@@ -108,7 +108,7 @@ G
 }
 guide_other() { cat >&2 <<'G'
   How to fix: update the CLI and try again:
-    ~/.local/bin/claude update && bash install.sh
+    ~/.local/bin/claude update && bash setup_claude.sh
   If it keeps failing, re-run with --reset-token, or open an issue with the log (it holds no secrets).
 G
 }
@@ -555,9 +555,9 @@ systemctl --user list-timers "$TIMER" --no-pager || true
 echo
 msg 'Done.'
 msg "Schedule: $TIMES ($TZNAME), model $MODEL"
-msg 'Status and recent runs:   bash install.sh --status'
-msg 'Replace the token:        bash install.sh --reset-token'
-msg 'Change the schedule:      bash install.sh --times 08:00,13:00 --tz Asia/Seoul'
-msg 'Remove:                   bash install.sh --uninstall'
+msg 'Status and recent runs:   bash setup_claude.sh --status'
+msg 'Replace the token:        bash setup_claude.sh --reset-token'
+msg 'Change the schedule:      bash setup_claude.sh --times 08:00,13:00 --tz Asia/Seoul'
+msg 'Remove:                   bash setup_claude.sh --uninstall'
 msg "Install log (no secrets): $LOG"
 msg 'If another scheduler (e.g. a claude.ai scheduled task) sends the same ping, turn it off to avoid duplicates.'
